@@ -1,0 +1,161 @@
+#!/bin/bash
+# =====================================================
+# Script: setup_task2_task3.sh
+# Purpose: Complete automation for Task 2 & 3
+#  - Task 2: Create API Gateway for Cloud Run function
+#  - Task 3: Create Pub/Sub topic & update Cloud Run function
+# Author: Aman Kumar
+# =====================================================
+
+# ===========================
+# STEP 0: Set environment variables
+# ===========================
+export PROJECT_ID=$(gcloud config get-value project)
+export REGION=us-central1
+
+# Cloud Run function variables
+export FUNCTION_NAME=helloHttp
+export FUNCTION_SOURCE_DIR=./cloudrun-function
+export FUNCTION_ENTRY_POINT=helloHttp
+
+# API Gateway variables
+export API_ID=gcfunction-api
+export CONFIG_ID=gcfunction-api
+export GATEWAY_ID=gcfunction-gateway
+export DISPLAY_NAME="gcfunction API"
+
+# Pub/Sub topic
+export TOPIC_NAME=demo-topic
+
+# ===========================
+# STEP 1: Create Cloud Run function source folder
+# ===========================
+mkdir -p $FUNCTION_SOURCE_DIR
+cd $FUNCTION_SOURCE_DIR || exit
+
+# -------------------
+# Create package.json
+# -------------------
+cat > package.json <<EOF
+{
+  "dependencies": {
+    "@google-cloud/functions-framework": "^3.0.0",
+    "@google-cloud/pubsub": "^3.4.1"
+  }
+}
+EOF
+
+# -------------------
+# Install dependencies
+# -------------------
+npm install
+
+# -------------------
+# Create index.js
+# -------------------
+cat > index.js <<EOF
+const { PubSub } = require('@google-cloud/pubsub');
+const pubsub = new PubSub();
+const topic = pubsub.topic('$TOPIC_NAME');
+const functions = require('@google-cloud/functions-framework');
+
+exports.$FUNCTION_ENTRY_POINT = functions.http('$FUNCTION_ENTRY_POINT', async (req, res) => {
+  try {
+    await topic.publishMessage({
+      data: Buffer.from('Hello from Cloud Run functions!'),
+    });
+    res.status(200).send("✅ Message sent to Topic $TOPIC_NAME!");
+  } catch (error) {
+    console.error("Error publishing message:", error);
+    res.status(500).send("❌ Failed to publish message.");
+  }
+});
+EOF
+
+# ===========================
+# STEP 2: Deploy Cloud Run function
+# ===========================
+echo "Deploying Cloud Run function..."
+gcloud functions deploy $FUNCTION_NAME \
+  --gen2 \
+  --runtime=nodejs18 \
+  --region=$REGION \
+  --source=. \
+  --entry-point=$FUNCTION_ENTRY_POINT \
+  --trigger-http \
+  --allow-unauthenticated
+
+# Get deployed Cloud Run URL
+CLOUD_RUN_URL=$(gcloud functions describe $FUNCTION_NAME --region=$REGION --format="value(serviceConfig.uri)")
+echo "Cloud Run function deployed at: $CLOUD_RUN_URL"
+
+# ===========================
+# STEP 3: Create API Gateway
+# ===========================
+cd .. || exit
+cat > openapispec.yaml <<EOF
+swagger: '2.0'
+info:
+  title: $DISPLAY_NAME
+  description: Sample API on API Gateway with a Google Cloud Run functions backend
+  version: 1.0.0
+schemes:
+- https
+produces:
+- application/json
+paths:
+  /gcfunction:
+    get:
+      summary: $FUNCTION_NAME
+      operationId: $FUNCTION_NAME
+      responses:
+        '200':
+          description: A successful response
+          schema:
+            type: string
+x-google-backend:
+  address: $CLOUD_RUN_URL
+EOF
+
+# Get default service account for API Gateway backend auth
+SERVICE_ACCOUNT=$(gcloud iam service-accounts list --filter="Compute Engine default service account" --format="value(email)")
+
+# Create API
+gcloud api-gateway apis create $API_ID --project=$PROJECT_ID
+
+# Create API config
+gcloud api-gateway api-configs create $CONFIG_ID \
+  --api=$API_ID \
+  --openapi-spec=openapispec.yaml \
+  --backend-auth-service-account=$SERVICE_ACCOUNT \
+  --project=$PROJECT_ID
+
+# Create Gateway
+gcloud api-gateway gateways create $GATEWAY_ID \
+  --api=$API_ID \
+  --api-config=$CONFIG_ID \
+  --location=$REGION \
+  --project=$PROJECT_ID
+
+# Get Gateway URL
+GATEWAY_URL=$(gcloud api-gateway gateways describe $GATEWAY_ID \
+  --location=$REGION \
+  --format="value(defaultHostname)")
+echo "API Gateway deployed at: https://$GATEWAY_URL/gcfunction"
+
+# ===========================
+# STEP 4: Create Pub/Sub topic
+# ===========================
+gcloud pubsub topics create $TOPIC_NAME --project=$PROJECT_ID || echo "Topic $TOPIC_NAME already exists"
+echo "Pub/Sub topic created: $TOPIC_NAME"
+
+# ===========================
+# STEP 5: Test API Gateway
+# ===========================
+echo "Invoking API Gateway endpoint..."
+curl -s -w "\n" https://$GATEWAY_URL/gcfunction
+
+# ===========================
+# Done
+# ===========================
+echo "✅ All tasks completed: Cloud Run deployed, API Gateway configured, Pub/Sub integrated."
